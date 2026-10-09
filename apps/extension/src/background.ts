@@ -1,4 +1,5 @@
 import {
+  clipNotebookId,
   edgeEverFormRequest,
   edgeEverRequest,
   getInstanceOrigin,
@@ -24,6 +25,13 @@ import {
   type StoredImage,
   type StoredImageFailure,
 } from "./image-clip";
+import {
+  embedPageImages,
+  pageImageRefs,
+  readBodyWithLimit,
+  readPageImageInPage,
+  type PageImageDownload,
+} from "./page-images";
 import {
   githubRepoFactsFromSource,
   githubRepoNoteMarkdown,
@@ -181,21 +189,23 @@ const describeSaveError = (error: unknown) => {
 
 const notebookForClip = async (settings: ExtensionSettings) => {
   const notebooks = await listNotebooks(settings);
-  const notebookId = settings.notebookId || notebooks.notebooks[0]?.id;
+  const notebookId = clipNotebookId(settings.notebookId, notebooks.notebooks);
   if (!notebookId) throw new Error(t("noAvailableNotebooks"));
   return notebookId;
 };
 
-const createMemo = async (settings: ExtensionSettings, page: CapturedPage) => {
-  await edgeEverRequest(settings, "/api/v1/memos", {
+const createMemo = async (settings: ExtensionSettings, page: CapturedPage, tabId: number | null) => {
+  const contentMarkdown = toMarkdown(page);
+  const created = await edgeEverRequest<{ memo?: CreatedClipMemo }>(settings, "/api/v1/memos", {
     method: "POST",
     body: JSON.stringify({
       notebookId: await notebookForClip(settings),
       title: page.title,
-      contentMarkdown: toMarkdown(page),
+      contentMarkdown,
       tags: ["web-clip"],
     }),
   });
+  await embedClipImages(settings, created.memo, contentMarkdown, page.url, tabId, null);
 };
 
 const createGithubRepoMemo = async (settings: ExtensionSettings, facts: GithubRepoFacts) => {
@@ -230,8 +240,8 @@ const imageNoteClient = (settings: ExtensionSettings): ImageNoteClient => ({
     method: "POST",
     body: JSON.stringify(body),
   }),
-  uploadImage: async (memoId, file) => {
-    const uploaded = await uploadMemoImage(settings, memoId, file);
+  uploadImage: async (memoId, file, signal) => {
+    const uploaded = await uploadMemoImage(settings, memoId, file, signal);
     return uploaded.resource;
   },
   createEditSession: (memoId) => edgeEverRequest(
@@ -345,7 +355,7 @@ const persistImage = async (
 ) => {
   try {
     await saveCapturedImageNote(imageNoteClient(settings), {
-      notebookId: settings.notebookId,
+      notebookId: await notebookForClip(settings),
       title: noteTitleForImage(context.pageTitle, context.alt, t("imageNoteFallbackTitle")),
       alt: context.alt,
       filename: filenameForImage(context.srcUrl, image.mimeType),
@@ -367,21 +377,36 @@ const persistImage = async (
   }
 };
 
-const downloadImage = async (urls: string[]): Promise<StoredImage | StoredImageFailure> => {
+const requestSignal = (timeoutMs: number, signal?: AbortSignal) => {
+  if (!signal) return AbortSignal.timeout(timeoutMs);
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  const timer = setTimeout(abort, timeoutMs);
+  controller.signal.addEventListener("abort", () => clearTimeout(timer), { once: true });
+  if (signal.aborted) abort();
+  else signal.addEventListener("abort", abort, { once: true });
+  return controller.signal;
+};
+
+const downloadImage = async (
+  urls: string[],
+  { maxBytes = MAX_IMAGE_BYTES, timeoutMs = 15000, signal }: { maxBytes?: number; timeoutMs?: number; signal?: AbortSignal } = {},
+): Promise<StoredImage | StoredImageFailure> => {
   const matchUrl = urls[urls.length - 1] ?? "";
   let matchError: StoredImageFailure["error"] | "" = "";
   for (const url of urls) {
     if (!/^https?:/i.test(url)) continue;
     for (const credentials of ["omit", "include"] as const) {
+      if (signal?.aborted) return { error: "unreadable" };
       try {
-        const response = await fetch(url, { credentials });
+        const response = await fetch(url, { credentials, signal: requestSignal(timeoutMs, signal) });
         if (!response.ok) continue;
-        const declared = Number(response.headers.get("content-length"));
-        if (Number.isFinite(declared) && declared > MAX_IMAGE_BYTES) {
+        const bytes = await readBodyWithLimit(response, maxBytes);
+        if (!bytes) {
           if (url === matchUrl) matchError = "too-large";
           continue;
         }
-        const image = imageFromBytes(new Uint8Array(await response.arrayBuffer()), response.headers.get("content-type") ?? "");
+        const image = imageFromBytes(bytes, response.headers.get("content-type") ?? "");
         if (!("error" in image)) return image;
         if (url === matchUrl) matchError = image.error;
       } catch {
@@ -391,6 +416,56 @@ const downloadImage = async (urls: string[]): Promise<StoredImage | StoredImageF
   }
   if (matchError === "too-large" || matchError === "unsupported") return { error: matchError };
   return { error: "unreadable" };
+};
+
+type CreatedClipMemo = { id?: string; revision?: number; contentHash?: string };
+
+const downloadPageImage = (tabId: number | null, frameId: number | null): PageImageDownload =>
+  async (image, { maxBytes, timeoutMs, signal }) => {
+    const file = await downloadImage([image.url], { maxBytes, timeoutMs, signal });
+    if (!("error" in file)) return file;
+    if (tabId === null || signal.aborted) return null;
+    try {
+      const [injection] = await chrome.scripting.executeScript({
+        target: scriptTarget(tabId, frameId),
+        func: readPageImageInPage,
+        args: [image.url, maxBytes, timeoutMs],
+      });
+      const read: unknown = injection?.result;
+      if (!read || typeof read !== "object") return null;
+      const { base64, type } = read as { base64?: unknown; type?: unknown };
+      if (typeof base64 !== "string") return null;
+      const fromPage = imageFromBase64(base64, typeof type === "string" ? type : "");
+      return "error" in fromPage ? null : fromPage;
+    } catch {
+      // The page cannot be scripted; this image keeps its remote address.
+      return null;
+    }
+  };
+
+const embedClipImages = async (
+  settings: ExtensionSettings,
+  memo: CreatedClipMemo | undefined,
+  markdown: string,
+  pageUrl: string,
+  tabId: number | null,
+  frameId: number | null,
+) => {
+  if (!memo?.id || typeof memo.revision !== "number" || typeof memo.contentHash !== "string") return;
+  const images = pageImageRefs(markdown, pageUrl);
+  if (images.length === 0) return;
+  try {
+    await embedPageImages(imageNoteClient(settings), {
+      memoId: memo.id,
+      markdown,
+      created: { revision: memo.revision, contentHash: memo.contentHash },
+      images,
+      download: downloadPageImage(tabId, frameId),
+    });
+  } catch {
+    // The note is already saved; reporting a failure here would invite a
+    // duplicate save. Its images keep their remote addresses.
+  }
 };
 
 const hasImagePermission = async (urls: string[]) => {
@@ -706,7 +781,7 @@ const saveTweetFromMenu = async (
       if (stored) images.push(stored);
     }
     await saveCapturedTweetNote(imageNoteClient(settings), {
-      notebookId: settings.notebookId,
+      notebookId: await notebookForClip(settings),
       title: tweetNoteTitle({ ...tweet, fallback: t("tweetNoteFallbackTitle") }),
       displayName: tweet.displayName,
       handle: tweet.handle,
@@ -831,7 +906,7 @@ const saveXhsFromMenu = async (
       if (stored) images.push(stored);
     }
     await saveCapturedXhsNote(imageNoteClient(settings), {
-      notebookId: settings.notebookId,
+      notebookId: await notebookForClip(settings),
       title: xhsNoteTitle({ ...note, fallback: t("xhsNoteFallbackTitle") }),
       nickname: note.nickname,
       noteTitle: note.title,
@@ -937,7 +1012,7 @@ const saveLocatedZhihu = async (
   }
   await saveCapturedZhihuNote(imageNoteClient(settings), {
     kind: note.kind,
-    notebookId: settings.notebookId,
+    notebookId: await notebookForClip(settings),
     title: zhihuNoteTitle({
       title: note.title,
       author: note.author,
@@ -1062,7 +1137,7 @@ const saveRedditFromMenu = async (
       if (stored) images.push({ ...stored, url: image.url });
     }
     await saveCapturedRedditPost(imageNoteClient(settings), post, {
-      notebookId: settings.notebookId,
+      notebookId: await notebookForClip(settings),
       sourceLabel: t("sourceLabel"),
       capturedAtLabel: t("capturedAtLabel"),
       timeLabel: t("tweetTimeLabel"),
@@ -1270,21 +1345,24 @@ const saveSelectionFromMenu = async (
     const markdown = fromSelection?.markdown.trim() || browserSelection;
     const plain = fromSelection?.plainText?.trim() || browserSelection || markdown;
     if (!markdown.trim()) throw new Error(t("selectionEmpty"));
-    await edgeEverRequest(settings, "/api/v1/memos", {
+    const sourceUrl = fromSelection?.url || pageUrl;
+    const contentMarkdown = selectionNoteMarkdown({
+      markdown,
+      pageUrl: sourceUrl,
+      capturedAt: new Date().toISOString(),
+      sourceLabel: t("sourceLabel"),
+      capturedAtLabel: t("capturedAtLabel"),
+    });
+    const created = await edgeEverRequest<{ memo?: CreatedClipMemo }>(settings, "/api/v1/memos", {
       method: "POST",
       body: JSON.stringify({
         notebookId: await notebookForClip(settings),
         title: selectionNoteTitle(plain, pageTitle, t("selectionNoteFallbackTitle")),
-        contentMarkdown: selectionNoteMarkdown({
-          markdown,
-          pageUrl: fromSelection?.url || pageUrl,
-          capturedAt: new Date().toISOString(),
-          sourceLabel: t("sourceLabel"),
-          capturedAtLabel: t("capturedAtLabel"),
-        }),
+        contentMarkdown,
         tags: ["web-clip"],
       }),
     });
+    await embedClipImages(settings, created.memo, contentMarkdown, sourceUrl, tabId, frameId);
     await showFeedback(tabId, frameId, t("selectionSaved"), "success");
   } catch (error) {
     const message = describeSelectionError(error);
@@ -1752,7 +1830,7 @@ chrome.runtime.onMessage.addListener((message: { type?: string; page?: CapturedP
         }
 
         const page = await readCapturedPage(tab.id, null, "page");
-        await createMemo(settings, page);
+        await createMemo(settings, page, tab.id);
         sendResponse({ ok: true });
       } catch (error) {
         const message = error instanceof Error ? error.message : "";
